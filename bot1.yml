@@ -1,0 +1,77 @@
+name: wunsch-bot
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"      # ca. alle 5 Minuten (GitHub kann das verzögern)
+  workflow_dispatch:           # manueller Start-Knopf
+    inputs:
+      modus:
+        description: "normal = Bot laufen lassen, test = Quellen-Test"
+        type: choice
+        options: [normal, test]
+        default: normal
+
+permissions:
+  contents: write              # damit der Bot die verschlüsselte Datei speichern darf
+
+concurrency:
+  group: wunsch-bot            # nie zwei Läufe gleichzeitig
+  cancel-in-progress: false
+
+env:
+  DATEN_ORDNER: ${{ runner.temp }}/daten   # hier liegt die entschlüsselte Datei nur während des Laufs
+
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Code holen
+        uses: actions/checkout@v4
+
+      - name: Daten entschlüsseln
+        env:
+          DATEN_KEY: ${{ secrets.DATEN_KEY }}
+        run: |
+          mkdir -p "$DATEN_ORDNER"
+          if [ -f daten.enc ]; then
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:DATEN_KEY \
+              -in daten.enc -out "$DATEN_ORDNER/daten.json"
+            cp "$DATEN_ORDNER/daten.json" "$DATEN_ORDNER/vorher.json"
+          fi
+
+      - name: Bot ausführen
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DATEN_KEY: ${{ secrets.DATEN_KEY }}
+        run: python3 bot1.py "${{ inputs.modus }}"
+
+      - name: Daten verschlüsselt speichern (nur wenn etwas geändert wurde)
+        if: always()
+        env:
+          DATEN_KEY: ${{ secrets.DATEN_KEY }}
+        run: |
+          if [ -f "$DATEN_ORDNER/daten.json" ] && ! cmp -s "$DATEN_ORDNER/daten.json" "$DATEN_ORDNER/vorher.json"; then
+            openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:DATEN_KEY \
+              -in "$DATEN_ORDNER/daten.json" -out daten.enc
+            git config user.name "wunsch-bot"
+            git config user.email "wunsch-bot@users.noreply.github.com"
+            git add daten.enc
+            git commit -m "Daten aktualisiert"
+            git pull --rebase
+            git push
+          fi
+
+      - name: Keepalive (verhindert die 60-Tage-Abschaltung)
+        if: always()
+        run: |
+          LETZTER=$(git log -1 --format=%ct)
+          JETZT=$(date +%s)
+          if [ $((JETZT - LETZTER)) -gt 3456000 ]; then   # älter als 40 Tage
+            git config user.name "wunsch-bot"
+            git config user.email "wunsch-bot@users.noreply.github.com"
+            git commit --allow-empty -m "keepalive"
+            git pull --rebase
+            git push
+          fi
